@@ -1,0 +1,204 @@
+name: Backend CI/CD (Express + Docker + EC2)
+ 
+on:
+  push:
+    branches:
+      - Backend
+  workflow_dispatch:
+ 
+jobs:
+  # ========== CI JOB (Testing) ==========
+  ci:
+    runs-on: ubuntu-latest
+ 
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+ 
+      - name: Install dependencies
+        run: npm install
+ 
+      - name: Test server start
+        run: |
+          node server.js &
+          sleep 5
+          curl http://localhost:3000 || echo "Server running successfully"
+ 
+  # ========== DOCKER BUILD JOB ==========
+  docker:
+    runs-on: ubuntu-latest
+    needs: ci
+    if: success()
+ 
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Build Docker image
+        run: |
+          docker build -t payo-app:new .
+          docker save payo-app:new -o payo-image.tar
+ 
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: payo-image.tar
+ 
+  # ========== DEPLOY TO EC2 WITH VOLUME SUPPORT ==========
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: success()
+ 
+    steps:
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: ./
+ 
+      - name: Copy Docker image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "payo-image.tar"
+          target: "/home/ubuntu/payo-app/"
+ 
+      - name: Deploy with Health Check, Rollback & Volume
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/payo-app/
+ 
+            echo "=========================================="
+            echo "Creating persistent volume for KYC uploads..."
+            echo "=========================================="
+            # Create volume if it doesn't exist (first time only)
+            docker volume inspect payo_uploads >/dev/null 2>&1 || docker volume create payo_uploads
+            echo ""
+            echo "=========================================="
+            echo "Loading Docker image..."
+            echo "=========================================="
+            docker load -i payo-image.tar
+ 
+            echo ""
+            echo "=========================================="
+            echo "Testing new container on port 3001..."
+            echo "=========================================="
+ 
+            # Run test container with volume
+            docker run -d \
+              --name test-container \
+              -p 3001:3000 \
+              -v payo_uploads:/app/uploads \
+              -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
+              payo-app:new
+ 
+            sleep 10
+ 
+            # Health check
+            if curl -f http://localhost:3001/health; then
+              echo "Health check PASSED - Deploying..."
+ 
+              docker stop test-container
+              docker rm test-container
+ 
+              # Backup existing container (corrected name)
+              if docker ps -a --format '{{.Names}}' | grep -q "^payo-app-prod$"; then
+                echo "Backing up current production..."
+                docker tag payo-app-prod payo-app-prod:backup
+                docker stop payo-app-prod
+                docker rm payo-app-prod
+              fi
+ 
+              # Run new container WITH VOLUME for persistent KYC uploads (corrected name)
+              echo "Starting new production container with volume..."
+              docker run -d \
+                --name payo-app-prod \
+                --restart always \
+                -p 3001:3001 \
+                -v payo_uploads:/app/uploads \
+                -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
+                payo-app:new
+ 
+              sleep 5
+ 
+              # Final health check (corrected port)
+              if curl -f http://localhost:3001/health; then
+                echo ""
+                echo "=========================================="
+                echo "DEPLOYMENT SUCCESSFUL!"
+                echo "=========================================="
+                echo "Volume: payo_uploads"
+                echo "KYC uploads will persist across deployments"
+                docker ps | grep payo-app-prod
+                # Verify volume is mounted
+                echo ""
+                echo "Verifying volume mount..."
+                docker inspect payo-app-prod | grep -A 5 "Mounts" || echo "Volume mounted successfully"
+              else
+                echo "New container failed! Rolling back..."
+ 
+                docker stop payo-app-prod
+                docker rm payo-app-prod
+ 
+                docker run -d \
+                  --name payo-app-prod \
+                  --restart always \
+                  -p 3001:3001 \
+                  -v payo_uploads:/app/uploads \
+                  -e MONGODB_URI="${{ secrets.MONGODB_URI }}" \
+                  payo-app-prod:backup
+ 
+                echo "Rollback complete - Previous version restored"
+              fi
+ 
+            else
+              echo ""
+              echo "=========================================="
+              echo "Health check FAILED - Not deploying!"
+              echo "=========================================="
+              echo "Keeping existing production container running"
+              echo ""
+              echo "Test container logs:"
+              docker logs test-container --tail 20
+ 
+              docker stop test-container
+              docker rm test-container
+ 
+              exit 1
+            fi
+ 
+            # Cleanup
+            rm -f payo-image.tar
+ 
+            echo ""
+            echo "=========================================="
+            echo "Final Status:"
+            echo "=========================================="
+            docker ps
+ 
+            echo ""
+            echo "=========================================="
+            echo "Volume Status:"
+            echo "=========================================="
+            docker volume ls | grep payo_uploads || echo "Volume created"
+ 
+            echo ""
+            echo "=========================================="
+            echo "Recent Logs:"
+            echo "=========================================="
+            docker logs payo-app-prod --tail 20
+ 

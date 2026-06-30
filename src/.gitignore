@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+API_Commands/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
